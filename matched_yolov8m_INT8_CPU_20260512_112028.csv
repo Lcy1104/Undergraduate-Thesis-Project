@@ -1,0 +1,2 @@
+Experiment,Image,PT_Device,OV_Precision_Device,PT_cx,PT_cy,PT_w,PT_h,OV_cx,OV_cy,OV_w,OV_h,IoU,cx_offset,cy_offset,w_offset,h_offset
+yolov8m_INT8_CPU,ds2_g14_1680_6_jpg.rf.41bfd250898a047394f805c0c0524b5e.jpg,cuda:0,CPU,208.00,221.24,416.00,389.53,207.47,220.44,413.99,388.11,0.9911,0.53,0.80,2.01,1.42

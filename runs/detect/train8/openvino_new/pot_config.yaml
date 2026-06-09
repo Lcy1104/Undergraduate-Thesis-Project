@@ -1,0 +1,14 @@
+model:
+  model: "E:/final_exam_test/handcraft/handcrafted/runs/detect/train8/openvino_new/FP32/best.xml"
+  weights: "E:/final_exam_test/handcraft/handcrafted/runs/detect/train8/openvino_new/FP32/best.bin"
+
+engine:
+  type: "simplified"
+  # 指向你的验证集图片文件夹（同样建议用绝对路径）
+  data_source: "E:/final_exam_test/handcraft/handcrafted/datasets/farukalam/tomato-leaf-diseases-detection-computer-vision/versions/all1/test/images"
+
+compression:
+  - algorithm: "DefaultQuantization"
+    params:
+      preset: "performance"
+      stat_subset_size: 300

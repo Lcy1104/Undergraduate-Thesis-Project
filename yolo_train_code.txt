@@ -1,0 +1,7 @@
+yolo train model=yolo26m.pt data=E:\final_exam_test\handcraft\handcrafted\datasets\farukalam\tomato-leaf-diseases-detection-computer-vision\versions\all1\data.yaml epochs=180 imgsz=640 batch=16 device=0 optimizer=MuSGD lr0=0.001 cos_lr=True warmup_epochs=5 progloss=True stal=True nmsfree=True name=yolo26m_tomato workers=8
+
+python -m uvicorn fastapi_backend:app --host 127.0.0.1 --port 8000
+streamlit run db.py --server.port 8080
+
+admin admin
+

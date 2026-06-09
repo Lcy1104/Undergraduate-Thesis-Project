@@ -1,0 +1,9 @@
+host: localhost
+port: 5432
+user: postgres
+password: root
+dbname: kb_db
+model_type: 双模型融合
+use_cuda: true
+user_city: 城阳区
+user_adcode: '370214'

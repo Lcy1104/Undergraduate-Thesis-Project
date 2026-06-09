@@ -1,0 +1,11 @@
+{
+  "模型": "E:\\final_exam_test\\handcraft\\handcrafted\\runs\\detect\\train8\\openvino_new\\FP32\\best.xml",
+  "输出": "E:\\final_exam_test\\handcraft\\handcrafted\\runs\\detect\\train8\\openvino_new\\best_int8_model\\best_int8.xml",
+  "设备": "GPU.0",
+  "校准图片": 389,
+  "校准目录": "calib_images_2024_3",
+  "耗时(秒)": 52.2,
+  "时间": "2026-01-24 11:28:27",
+  "OpenVINO版本": "2025.4.1",
+  "NNCF版本": "2.19.0"
+}

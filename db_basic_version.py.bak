@@ -1,0 +1,1501 @@
+# -*- coding: utf-8 -*-
+import warnings
+
+warnings.filterwarnings('ignore')
+import logging
+import time
+import traceback
+import os
+import json
+# 严格按你的要求：仅导入Client类，不导入顶层chat函数
+from ollama import Client  # 导入Client类，而非直接导入顶层chat函数
+from pydantic import BaseModel  # 严格对齐你的导入方式
+
+logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
+
+# ========== 新增：隐藏Streamlit顶部占用（参考链接CSS，修正拼写错误） ==========
+HIDE_ST_STYLE = """
+<style>
+/* 隐藏顶部Header、Toolbar、装饰条 */
+div[data-testid="stHeader"] {
+    visibility: hidden;
+    height: 0px;
+    position: fixed;
+}
+div[data-testid="stToolbar"] {
+    visibility: hidden;
+    height: 0px;
+    position: fixed;
+}
+div[data-testid="stDecoration"] {
+    visibility: hidden;
+    height: 0px;
+    position: fixed;
+}
+/* 隐藏顶部主菜单 */
+#MainMenu {
+    visibility: hidden;
+    height: 0px;
+}
+/* 隐藏页头、页脚 */
+header {
+    visibility: hidden;
+    height: 0px;
+}
+footer {
+    visibility: hidden;
+    height: 0%;
+}
+/* 调整主内容区padding，避免内容顶边太拥挤 */
+div[data-testid="stMainBlockContainer"] {
+    padding: 0.5rem 1rem 10rem !important;
+}
+</style>
+"""
+# ========== 新增结束 ==========
+
+# ========== 国内环境适配+CUDA优化 ==========
+os.environ["TRANSFORMERS_OFFLINE"] = "1"
+os.environ["HF_DATASETS_OFFLINE"] = "1"
+os.environ["CUDA_LAUNCH_BLOCKING"] = "1"
+os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "max_split_size_mb:64,garbage_collection_threshold:0.5"
+
+# ====================== 解决AutoTokenizer导入兼容 ==========
+try:
+    from transformers import AutoTokenizer, AutoModel
+except ImportError:
+    from transformers.models.auto.tokenization_auto import AutoTokenizer
+    from transformers.models.auto.modeling_auto import AutoModel
+
+# ====================== 保留所有核心依赖（jieba完整可用） ==========
+import streamlit as st
+import psycopg2
+import psycopg2.errors
+import numpy as np
+import re
+import torch
+import pandas as pd
+import jieba  # 完整保留
+from collections import defaultdict
+from psycopg2.extras import RealDictCursor
+from pgvector.psycopg2 import register_vector
+import pdfplumber
+from docx import Document
+from scipy.spatial.distance import cosine
+
+# ====================== 全局配置（保留原有 + 简化Ollama配置） ==========
+LOCAL_MODEL_ROOT_PATH = r"F:\MaxKB-2.1.2\MaxKB-2.1.2\models"
+TEXT2VEC_MODEL_PATH = os.path.join(LOCAL_MODEL_ROOT_PATH, "models--shibing624--text2vec-base-chinese/snapshots/183bb99aa7af74355fb58d16edf8c13ae7c5433e")
+BERT_MODEL_PATH = os.path.join(LOCAL_MODEL_ROOT_PATH, "bert-base-chinese")
+
+DEFAULT_DB_CONFIG = {
+    "host": "localhost",
+    "port": 5432,
+    "user": "postgres",
+    "password": "",
+    "dbname": "kb_db"
+}
+PAGE_SIZE = 10
+FILE_PROCESS_TIMEOUT = 120
+MAX_FILES_PER_UPLOAD = 5
+USE_CUDA_DEFAULT = False
+CHUNK_RETRY_TIMES = 2
+FILE_RETRY_TIMES = 1
+CHUNK_SIZE_DEFAULT = 150
+MIN_LENGTH_DEFAULT = 30
+TEXT2VEC_WEIGHT = 0.6
+BERT_WEIGHT = 0.4
+# 内置合理阈值，无需用户调节
+BUILT_IN_MIN_SIMILARITY = 0.5
+KEYWORD_MATCH_WEIGHT = 0.4
+# Ollama配置（仅保留模型名称，host严格在Client实例化时指定）
+OLLAMA_MODEL = "deepseek-r1:7b"  # deepseek模型名称
+
+# ====================== 柔性停用词（完全保留） ==========
+CORE_STOP_WORDS = {
+    "的", "了", "是", "我", "你", "他", "她", "它", "我们", "你们", "他们",
+    "这", "那", "个", "和", "与", "或", "在", "于", "为", "对", "同", "跟",
+    "把", "被", "从", "到", "有", "无", "不", "没", "会", "能", "要", "将",
+    "就", "还", "也", "又", "而", "则"
+}
+
+SCENE_STOP_WORDS = {
+    "件", "只", "本", "页", "行", "列"
+}
+
+USER_DEFINE_STOP_WORDS = set()
+
+# ====================== 1. 严格按你的Country模型逻辑定义Pydantic模型（顶格类，类内4空格缩进） ==========
+# 完全对齐你的Country模型格式：顶格定义类，类内4个空格缩进，字段明确
+class KnowledgeBaseAnswer(BaseModel):
+    kb_search_results: str  # 4空格缩进，与你的Country模型一致
+    thinking_process: str   # 4空格缩进，与你的Country模型一致
+    final_conclusion: str   # 4空格缩进，与你的Country模型一致
+
+# ====================== 精准关键词提取（完全保留 + 关键词匹配） ==========
+def calculate_word_weight(word, text, word_pos_dict):
+    if word in CORE_STOP_WORDS:
+        return 0.0
+
+    word_base_weight = 0.8 if word not in SCENE_STOP_WORDS else 0.2
+    if word in USER_DEFINE_STOP_WORDS:
+        word_base_weight *= 0.1
+
+    word_count = text.count(word)
+    total_word_count = len(jieba.lcut(text))
+    freq_weight = word_count / total_word_count if total_word_count > 0 else 0.0
+
+    pos_weights = []
+    if word in word_pos_dict:
+        text_length = len(text)
+        for pos in word_pos_dict[word]:
+            if pos / text_length <= 0.2 or pos / text_length >= 0.8:
+                pos_weights.append(1.0)
+            else:
+                pos_weights.append(0.5)
+    pos_weight = np.mean(pos_weights) if pos_weights else 0.5
+
+    total_weight = (freq_weight * 0.4) + (pos_weight * 0.4) + (word_base_weight * 0.2)
+    return round(total_weight, 4)
+
+
+def extract_keywords_optimized(text, top_k=3):
+    text_clean = re.sub(r'[^\u4e00-\u9fa5a-zA-Z0-9]', '', text)[:500]
+    if not text_clean:
+        return ["未提取到关键词"]
+
+    words = jieba.lcut(text_clean)
+    word_pos_dict = defaultdict(list)
+    for idx, word in enumerate(words):
+        word_start_pos = len("".join(words[:idx]))
+        word_pos_dict[word].append(word_start_pos)
+
+    candidate_words = [word for word in words if len(word) >= 2]
+    if not candidate_words:
+        return ["未提取到关键词"]
+
+    word_weight_dict = {}
+    for word in set(candidate_words):
+        word_weight_dict[word] = calculate_word_weight(word, text_clean, word_pos_dict)
+
+    sorted_word_weights = sorted(word_weight_dict.items(), key=lambda x: x[1], reverse=True)
+    valid_word_weights = [(word, weight) for word, weight in sorted_word_weights if weight > 0.0]
+    if not valid_word_weights:
+        return ["未提取到关键词"]
+
+    top_words = [word for word, _ in valid_word_weights[:top_k]]
+    return top_words
+
+
+# 新增：jieba分词缓存字典（全局）
+jieba_cache = {}
+
+
+def calculate_keyword_match_score(query, chunk_content, top_k=5):
+    # 缓存查询文本的分词结果
+    if query not in jieba_cache:
+        jieba_cache[query] = extract_keywords_optimized(query, top_k=top_k)
+    query_keywords = set(jieba_cache[query])
+
+    # 缓存分段文本的分词结果
+    if chunk_content not in jieba_cache:
+        jieba_cache[chunk_content] = extract_keywords_optimized(chunk_content, top_k=top_k)
+    chunk_keywords = set(jieba_cache[chunk_content])
+
+    if not query_keywords or query_keywords == {"未提取到关键词"}:
+        return 0.0
+    intersection = len(query_keywords & chunk_keywords)
+    union = len(query_keywords | chunk_keywords)
+    return intersection / union if union > 0 else 0.0
+
+
+def generate_auto_chunk_title_optimized(file_name, chunk_content, chunk_idx, page_num=None):
+    keywords = extract_keywords_optimized(chunk_content)
+    keyword_str = "、".join(keywords)
+    base_title = f"{os.path.splitext(file_name)[0]} - {keyword_str}"
+    if page_num:
+        base_title += f"（第{page_num}页）"
+    final_title = f"{base_title} - 第{chunk_idx + 1}段"
+    if len(final_title) > 50:
+        final_title = final_title[:50] + "..."
+    return final_title
+
+
+# ====================== 停用词配置面板（完全保留） ==========
+def stop_word_config_panel():
+    st.sidebar.divider()
+    st.sidebar.subheader("🔧 停用词配置")
+    st.sidebar.caption("仅调整场景停用词")
+
+    scene_stop_words_str = "、".join(SCENE_STOP_WORDS)
+    st.sidebar.info(f"当前：{scene_stop_words_str}")
+
+    col_add, col_del = st.sidebar.columns(2)
+    with col_add:
+        new_stop_word = st.text_input("添加", placeholder="单个词汇", key="add_sw")
+        if st.button("➕", key="add_btn"):
+            if new_stop_word and new_stop_word not in SCENE_STOP_WORDS:
+                SCENE_STOP_WORDS.add(new_stop_word)
+                st.sidebar.success(f"添加：{new_stop_word}")
+                st.rerun()
+            elif new_stop_word in SCENE_STOP_WORDS:
+                st.sidebar.warning("已存在")
+    with col_del:
+        del_stop_word = st.selectbox("删除", options=list(SCENE_STOP_WORDS), key="del_sw", index=0)
+        if st.button("➖", key="del_btn"):
+            SCENE_STOP_WORDS.remove(del_stop_word)
+            st.sidebar.success(f"删除：{del_stop_word}")
+            st.rerun()
+
+
+# ====================== 双模型编码器（完全保留） ==========
+@st.cache_resource(ttl=3600, show_spinner="加载本地模型中...")
+def get_local_encoder(use_cuda=USE_CUDA_DEFAULT, model_type="双模型融合"):
+    class LocalText2VecBERTEncoder:
+        def __init__(self, use_cuda=use_cuda, model_type=model_type):
+            self.use_model = True
+            self.device = torch.device("cpu")
+            self.model_type = model_type
+            self.text2vec_tokenizer = None
+            self.text2vec_model = None
+            self.bert_tokenizer = None
+            self.bert_model = None
+
+            if torch.cuda.is_available() and use_cuda:
+                self.device = torch.device("cuda")
+                torch.cuda.empty_cache()
+                torch.cuda.reset_max_memory_allocated()
+
+            st.info(f"📌 计算设备：{self.device} | 模型类型：{self.model_type}（jieba可用）")
+
+            try:
+                if self.model_type in ["text2vec-base-chinese", "双模型融合"]:
+                    self.text2vec_tokenizer = AutoTokenizer.from_pretrained(
+                        TEXT2VEC_MODEL_PATH,
+                        local_files_only=True,
+                        trust_remote_code=True
+                    )
+                    self.text2vec_model = AutoModel.from_pretrained(
+                        TEXT2VEC_MODEL_PATH,
+                        local_files_only=True,
+                        trust_remote_code=True
+                    ).to(self.device).eval()
+                    st.success(f"✅ text2vec-base-chinese 加载成功")
+
+                if self.model_type in ["bert-base-chinese", "双模型融合"]:
+                    self.bert_tokenizer = AutoTokenizer.from_pretrained(
+                        BERT_MODEL_PATH,
+                        local_files_only=True,
+                        trust_remote_code=True
+                    )
+                    self.bert_model = AutoModel.from_pretrained(
+                        BERT_MODEL_PATH,
+                        local_files_only=True,
+                        trust_remote_code=True
+                    ).to(self.device).eval()
+                    st.success(f"✅ bert-base-chinese 加载成功")
+
+            except Exception as e:
+                error_msg = f"💥 模型加载失败：{str(e)[:100]}"
+                st.error(error_msg)
+                logging.error(f"模型加载失败详情：{traceback.format_exc()}")
+                self.use_model = False
+                return
+
+        def _encode_text2vec(self, text):
+            inputs = self.text2vec_tokenizer(
+                text,
+                truncation=True,
+                max_length=128,
+                padding="max_length",
+                return_tensors="pt"
+            )
+            inputs = {k: v.to(self.device) for k, v in inputs.items()}
+            with torch.no_grad():
+                if self.device.type == "cuda":
+                    torch.cuda.synchronize()
+                outputs = self.text2vec_model(** inputs)
+            vec = outputs.last_hidden_state[:, 0, :].squeeze().cpu().numpy()
+            return vec
+
+        def _encode_bert(self, text):
+            inputs = self.bert_tokenizer(
+                text,
+                truncation=True,
+                max_length=128,
+                padding="max_length",
+                return_tensors="pt"
+            )
+            inputs = {k: v.to(self.device) for k, v in inputs.items()}
+            with torch.no_grad():
+                if self.device.type == "cuda":
+                    torch.cuda.synchronize()
+                outputs = self.bert_model(** inputs)
+            mask = inputs['attention_mask'].cpu().numpy()
+            hidden_state = outputs.last_hidden_state.squeeze().cpu().numpy()
+            mask_expanded = np.broadcast_to(mask.reshape(-1, 1), hidden_state.shape)
+            sum_embeddings = np.sum(hidden_state * mask_expanded, axis=0)
+            sum_mask = np.clip(mask_expanded.sum(axis=0), a_min=1e-9, a_max=None)
+            vec = sum_embeddings / sum_mask
+            return vec
+
+        def _fusion_vectors(self, vec1, vec2, weight1=TEXT2VEC_WEIGHT, weight2=BERT_WEIGHT):
+            fusion_vec = (weight1 * vec1) + (weight2 * vec2)
+            return fusion_vec
+
+        def encode_text(self, text):
+            if not isinstance(text, str):
+                return np.zeros(768)
+
+            if self.use_model:
+                try:
+                    vec = np.zeros(768)
+                    if self.model_type == "text2vec-base-chinese":
+                        if self.text2vec_tokenizer and self.text2vec_model:
+                            vec = self._encode_text2vec(text)
+                    elif self.model_type == "bert-base-chinese":
+                        if self.bert_tokenizer and self.bert_model:
+                            vec = self._encode_bert(text)
+                    elif self.model_type == "双模型融合":
+                        if self.text2vec_tokenizer and self.text2vec_model and self.bert_tokenizer and self.bert_model:
+                            vec1 = self._encode_text2vec(text)
+                            vec2 = self._encode_bert(text)
+                            vec = self._fusion_vectors(vec1, vec2)
+
+                    if self.device.type == "cuda":
+                        torch.cuda.empty_cache()
+                    norm = np.linalg.norm(vec)
+                    if norm == 0:
+                        return vec
+                    return vec / norm
+                except Exception as e:
+                    st.warning(f"⚠️ 模型编码失败，使用jieba特征：{str(e)[:50]}")
+                    return self._jieba_text_feature(text)
+            else:
+                return self._jieba_text_feature(text)
+
+        def _jieba_text_feature(self, text):
+            text_clean = re.sub(r'\W+', '', text)[:200]
+            words = jieba.lcut(text_clean)
+            feature = np.zeros(768)
+            for i, word in enumerate(words[:768]):
+                feature[i] = hash(word) % 1000 / 1000
+            norm = np.linalg.norm(feature)
+            if norm == 0:
+                return feature
+            return feature / norm
+
+        def calculate_similarity(self, text1, text2):
+            try:
+                vec1 = self.encode_text(text1)
+                vec2 = self.encode_text(text2)
+                sim = 1 - cosine(vec1, vec2)
+                return max(0.0, min(1.0, sim))
+            except Exception as e:
+                st.warning(f"⚠️ 相似度计算失败，使用词集合匹配：{str(e)[:50]}")
+                words1 = set(jieba.lcut(text1[:100]))
+                words2 = set(jieba.lcut(text2[:100]))
+                total = len(words1) + len(words2)
+                if total == 0:
+                    return 0.0
+                return len(words1 & words2) / total
+
+    return LocalText2VecBERTEncoder(use_cuda, model_type)
+
+
+# ====================== 文本清洗+分段逻辑（完全保留） ==========
+def clean_text_local(text):
+    if not isinstance(text, str):
+        return ""
+    text = re.sub(r'[\x00-\x1f\x7f]', '', text)  # 过滤不可见字符
+    text = re.sub(r'\s{2,}', ' ', text)  # 过滤多余空格
+    text = re.sub(r'行\d+', '', text)  # 过滤Excel行号（如“行262”）
+    text = re.sub(r'分段标题（选填）', '', text)  # 过滤Excel冗余标注
+    text = re.sub(r'问题（选填，单元格内一行一个）', '', text)  # 过滤Excel冗余标注
+    text = text.strip()
+    return text
+
+
+def retry_chunk_process(func, *args, retry_times=CHUNK_RETRY_TIMES, **kwargs):
+    for attempt in range(retry_times + 1):
+        try:
+            return func(*args, **kwargs), "success"
+        except TimeoutError as e:
+            if attempt < retry_times:
+                st.warning(f"⚠️ 分段重试{attempt + 1}/{retry_times + 1}：超时")
+                time.sleep(1)
+            else:
+                st.error(f"💥 分段重试失败：超时")
+                return None, "timeout"
+        except Exception as e:
+            if attempt < retry_times:
+                st.warning(f"⚠️ 分段重试{attempt + 1}/{retry_times + 1}：{str(e)[:50]}")
+                time.sleep(1)
+            else:
+                st.error(f"💥 分段重试失败：{str(e)[:50]}")
+                return None, "fail"
+    return None, "fail"
+
+
+def split_text_with_retry(text, encoder, chunk_size=CHUNK_SIZE_DEFAULT, sim_threshold=0.8,
+                          min_length=MIN_LENGTH_DEFAULT):
+    def _inner_split():
+        text_clean = ""
+        try:
+            text_clean = clean_text_local(text)
+            if len(text_clean) < min_length:
+                return [text_clean] if text_clean else []
+        except Exception as e:
+            st.warning(f"⚠️ 文本清洗失败：{str(e)[:50]}")
+            return []
+
+        sentences = re.split(r'[。！？；：\n]', text_clean)
+        sentences = [s.strip() for s in sentences if len(s.strip()) > 1]
+        if len(sentences) < 2:
+            return [text_clean[:chunk_size]] if text_clean else []
+
+        chunks = []
+        current_chunk = [sentences[0]]
+        start_time = time.time()
+
+        for sent in sentences[1:]:
+            if time.time() - start_time > FILE_PROCESS_TIMEOUT:
+                raise TimeoutError("分段处理超时")
+
+            current_chunk_str = ''.join(current_chunk)
+            if len(current_chunk_str + sent) > chunk_size:
+                if len(current_chunk_str) >= min_length:
+                    chunks.append(current_chunk_str)
+                    current_chunk = [sent]
+                else:
+                    current_chunk.append(sent)
+            else:
+                current_chunk.append(sent)
+
+        final_chunk_str = ''.join(current_chunk)
+        if len(final_chunk_str) >= 1:
+            chunks.append(final_chunk_str)
+
+        return chunks or [text_clean]
+
+    start_time = time.time()
+    chunks, status = retry_chunk_process(_inner_split)
+    return chunks or [], status
+
+
+# ====================== PDF解析（完全保留） ==========
+def parse_pdf_optimized(file):
+    raw_text = ""
+    page_num_record = None
+    try:
+        with pdfplumber.open(file) as pdf:
+            for page_num, page in enumerate(pdf.pages, 1):
+                page_text = page.extract_text() or ""
+                if not page_text:
+                    text_blocks = page.extract_words()
+                    if text_blocks:
+                        page_text = " ".join([block['text'] for block in text_blocks])
+                if page_text.strip():
+                    raw_text += f"【第{page_num}页】{page_text}\n"
+                    page_num_record = page_num
+                else:
+                    st.warning(f"⚠️ PDF第{page_num}页无有效文本，跳过")
+        return raw_text, page_num_record
+    except Exception as e:
+        st.error(f"💥 PDF解析失败：{str(e)[:100]}")
+        return "", None
+
+
+def parse_file_with_auto_retry(file, encoder, chunk_size=CHUNK_SIZE_DEFAULT, sim_threshold=0.8,
+                               min_length=MIN_LENGTH_DEFAULT):
+    file_name = file.name
+    raw_text = ""
+    page_num_record = None
+    file_status = "success"
+
+    for attempt in range(FILE_RETRY_TIMES + 1):
+        try:
+            raw_text = ""
+            page_num_record = None
+            if file_name.endswith('.pdf'):
+                raw_text, page_num_record = parse_pdf_optimized(file)
+                if not raw_text:
+                    st.warning(f"⚠️ {file_name}：未提取到文本，可能是加密PDF或图片PDF（扫描件）")
+                    if attempt < FILE_RETRY_TIMES:
+                        continue
+                    else:
+                        return [], False, "fail", file_name
+            elif file_name.endswith('.txt'):
+                try:
+                    raw_text = file.getvalue().decode('utf-8')
+                except:
+                    raw_text = file.getvalue().decode('gbk')
+            elif file_name.endswith('.docx'):
+                doc = Document(file)
+                for para in doc.paragraphs:
+                    para_text = para.text.strip()
+                    if para_text:
+                        raw_text += para_text + "\n"
+            elif file_name.endswith('.xlsx') or file_name.endswith('.xls'):
+                df = pd.read_excel(file, dtype=str).fillna("")
+                for idx, row in df.iterrows():
+                    row_text = " | ".join([f"{col}：{val}" for col, val in row.items()])
+                    raw_text += f"行{idx + 1}：{row_text}\n"
+            else:
+                st.error(f"❌ 不支持格式：{file_name}")
+                return [], False, "fail", file_name
+
+            chunks, chunk_status = split_text_with_retry(raw_text, encoder, chunk_size, sim_threshold, min_length)
+            file_status = chunk_status
+
+            if not chunks:
+                if attempt < FILE_RETRY_TIMES:
+                    st.warning(f"⚠️ 文件{file_name}重试{attempt + 1}/{FILE_RETRY_TIMES + 1}")
+                    time.sleep(2)
+                    continue
+                else:
+                    st.warning(f"⚠️ 文件{file_name}无有效分段")
+                    return [], False, file_status, file_name
+
+            chunk_with_title = []
+            for idx, chunk in enumerate(chunks):
+                if chunk.strip():
+                    title = generate_auto_chunk_title_optimized(file_name, chunk, idx, page_num_record)
+                    chunk_with_title.append((title, chunk))
+
+            if not chunk_with_title:
+                if attempt < FILE_RETRY_TIMES:
+                    st.warning(f"⚠️ 文件{file_name}重试{attempt + 1}/{FILE_RETRY_TIMES + 1}（无空分段）")
+                    time.sleep(2)
+                    continue
+                else:
+                    return [], False, "fail", file_name
+
+            st.success(f"✅ {file_name}：生成{len(chunk_with_title)}个分段")
+            return chunk_with_title, True, "success", file_name
+
+        except TimeoutError as e:
+            file_status = "timeout"
+            if attempt < FILE_RETRY_TIMES:
+                st.warning(f"⚠️ 文件{file_name}超时重试{attempt + 1}/{FILE_RETRY_TIMES + 1}")
+                time.sleep(2)
+                continue
+            else:
+                st.error(f"💥 文件{file_name}超时失败")
+                return [], False, file_status, file_name
+        except Exception as e:
+            file_status = "fail"
+            if attempt < FILE_RETRY_TIMES:
+                st.warning(f"⚠️ 文件{file_name}失败重试{attempt + 1}/{FILE_RETRY_TIMES + 1}：{str(e)[:50]}")
+                time.sleep(2)
+                continue
+            else:
+                st.error(f"💥 文件{file_name}失败：{str(e)[:50]}")
+                return [], False, file_status, file_name
+
+
+# ====================== 数据库操作类（保留原有功能 + 修复冗余bug） ==========
+class LocalPGVectorDB:
+    def __init__(self, db_config):
+        self.config = db_config
+        self.conn = None
+        self.cursor = None
+        self._connect()
+        self._fix_schema_local()
+        st.success("✅ 数据库初始化完成")
+
+    def _connect(self):
+        try:
+            if self.cursor:
+                self.cursor.close()
+            if self.conn:
+                self.conn.close()
+
+            base_conn = psycopg2.connect(
+                dbname="postgres", user=self.config['user'], password=self.config['password'],
+                host=self.config['host'], port=self.config['port']
+            )
+            base_conn.autocommit = True
+            base_cursor = base_conn.cursor()
+            base_cursor.execute(f"SELECT 1 FROM pg_database WHERE datname='{self.config['dbname']}';")
+            if not base_cursor.fetchone():
+                base_cursor.execute(f"CREATE DATABASE {self.config['dbname']} ENCODING 'UTF8';")
+                st.success(f"✅ 创建数据库 {self.config['dbname']}")
+            base_cursor.close()
+            base_conn.close()
+
+            self.conn = psycopg2.connect(** self.config)
+            self.conn.autocommit = False
+            self.cursor = self.conn.cursor(cursor_factory=RealDictCursor)
+            register_vector(self.conn)
+            st.success("✅ 数据库连接成功（已注册pgvector）")
+
+        except Exception as e:
+            st.error(f"💥 数据库连接失败：{str(e)[:80]}")
+            logging.error(f"数据库失败详情：{traceback.format_exc()}")
+
+    def _fix_schema_local(self):
+        try:
+            self.cursor.execute("CREATE EXTENSION IF NOT EXISTS vector;")
+
+            create_sql = [
+                """
+                CREATE TABLE IF NOT EXISTS knowledge_base (
+                    id SERIAL PRIMARY KEY,
+                    name VARCHAR(100) NOT NULL UNIQUE,
+                    create_time TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                );
+                """,
+                """
+                CREATE TABLE IF NOT EXISTS documents (
+                    id SERIAL PRIMARY KEY,
+                    kb_id INT REFERENCES knowledge_base(id) ON DELETE CASCADE,
+                    name VARCHAR(200) NOT NULL,
+                    create_time TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                );
+                """,
+                """
+                CREATE TABLE IF NOT EXISTS text_chunks (
+                    id SERIAL PRIMARY KEY,
+                    doc_id INT REFERENCES documents(id) ON DELETE CASCADE,
+                    title VARCHAR(200) DEFAULT '未命名分段',
+                    content TEXT NOT NULL,
+                    embedding vector(768) NOT NULL,
+                    create_time TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                );
+                """
+            ]
+            for sql in create_sql:
+                self.cursor.execute(sql)
+
+            self.cursor.execute("""
+                SELECT column_name FROM information_schema.columns
+                WHERE table_name = 'documents' AND column_name = 'status';
+            """)
+            if not self.cursor.fetchone():
+                self.cursor.execute("""
+                    ALTER TABLE documents ADD COLUMN status VARCHAR(20) DEFAULT 'success';
+                """)
+                st.success("✅ 给documents表新增status字段")
+
+            self.conn.commit()
+        except Exception as e:
+            self.conn.rollback()
+            st.error(f"💥 表结构修复失败：{str(e)[:80]}")
+            logging.error(f"表结构失败详情：{traceback.format_exc()}")
+
+    def get_kb_id(self, kb_name):
+        try:
+            self.cursor.execute("INSERT INTO knowledge_base (name) VALUES (%s) RETURNING id;", (kb_name,))
+            kb_id = self.cursor.fetchone()['id']
+            self.conn.commit()
+            st.success(f"✅ 新建知识库「{kb_name}」")
+            return kb_id
+        except psycopg2.errors.UniqueViolation:
+            self.conn.rollback()
+            self.cursor.execute("SELECT id FROM knowledge_base WHERE name=%s;", (kb_name,))
+            result = self.cursor.fetchone()
+            if result:
+                kb_id = result['id']
+                st.info(f"ℹ️ 追加到知识库「{kb_name}」")
+                return kb_id
+            return None
+        except Exception as e:
+            self.conn.rollback()
+            st.error(f"💥 知识库操作失败：{str(e)[:80]}")
+            return None
+
+    def batch_upload_auto_retry(self, kb_id, files, encoder, chunk_size=CHUNK_SIZE_DEFAULT, sim_threshold=0.8):
+        if encoder is None:
+            st.error("💥 编码工具未初始化，无法处理文件")
+            return 0, 0, {}
+
+        if not kb_id or not files:
+            return 0, 0, {}
+
+        total_success = 0
+        total_chunks = 0
+        file_status_dict = {}
+        progress = st.progress(0, text="批量处理中...")
+
+        self.cursor.execute("""
+            SELECT name FROM documents WHERE kb_id=%s AND status IN ('timeout', 'fail');
+        """, (kb_id,))
+        timeout_file_names = [doc['name'] for doc in self.cursor.fetchall()]
+        if timeout_file_names:
+            st.info(f"ℹ️ 检测到{len(timeout_file_names)}个待重试文件：{', '.join(timeout_file_names)}")
+
+        file_name_to_file = {file.name: file for file in files}
+        all_file_names = list(file_name_to_file.keys())
+
+        for idx, file_name in enumerate(all_file_names):
+            file = file_name_to_file[file_name]
+            progress.progress((idx + 1) / len(all_file_names),
+                              text=f"处理 {file_name} ({idx + 1}/{len(all_file_names)})")
+
+            self.cursor.execute("""
+                SELECT status FROM documents WHERE kb_id=%s AND name=%s;
+            """, (kb_id, file_name))
+            existing_doc = self.cursor.fetchone()
+            if existing_doc and existing_doc['status'] == 'success':
+                st.info(f"ℹ️ {file_name} 已成功，跳过")
+                file_status_dict[file_name] = ('success_skipped', 0)
+                continue
+
+            chunks_with_title, success, file_status, _ = parse_file_with_auto_retry(file, encoder, chunk_size,
+                                                                                    sim_threshold)
+
+            if not success or not chunks_with_title:
+                file_status_dict[file_name] = (file_status, 0)
+                if existing_doc:
+                    self.cursor.execute("""
+                        UPDATE documents SET status=%s WHERE kb_id=%s AND name=%s;
+                    """, (file_status, kb_id, file_name))
+                else:
+                    self.cursor.execute("""
+                        INSERT INTO documents (kb_id, name, status) VALUES (%s, %s, %s);
+                    """, (kb_id, file_name, file_status))
+                self.conn.commit()
+                st.warning(f"⚠️ 跳过 {file_name}：{file_status}")
+                continue
+
+            if existing_doc:
+                self.cursor.execute("""
+                    UPDATE documents SET status=%s WHERE kb_id=%s AND name=%s RETURNING id;
+                """, ('success', kb_id, file_name))
+                doc_id = self.cursor.fetchone()['id']
+            else:
+                self.cursor.execute("""
+                    INSERT INTO documents (kb_id, name, status) VALUES (%s, %s, %s) RETURNING id;
+                """, (kb_id, file_name, 'success'))
+                doc_id = self.cursor.fetchone()['id']
+
+            chunk_count = 0
+            for title, chunk in chunks_with_title:
+                if not isinstance(chunk, str):
+                    st.warning(f"⚠️ 无效分段内容，跳过")
+                    continue
+                embedding = encoder.encode_text(chunk)
+                self.cursor.execute("""
+                    INSERT INTO text_chunks (doc_id, title, content, embedding)
+                    VALUES (%s, %s, %s, %s);
+                """, (doc_id, title, chunk, embedding.tolist()))
+                chunk_count += 1
+
+            self.conn.commit()
+            total_success += 1
+            total_chunks += chunk_count
+            file_status_dict[file_name] = ('success', chunk_count)
+            st.success(f"✅ {file_name}：新增{chunk_count}个分段")
+
+        progress.progress(1.0, text=f"处理完成：成功{total_success}/{len(all_file_names)}文件，共{total_chunks}分段")
+        return total_success, total_chunks, file_status_dict
+
+    def get_all_kbs(self):
+        try:
+            self.cursor.execute("""
+                SELECT kb.id, kb.name, kb.create_time,
+                       COUNT(DISTINCT d.id) as doc_count,
+                       COUNT(t.id) as chunk_count
+                FROM knowledge_base kb
+                LEFT JOIN documents d ON kb.id = d.kb_id
+                LEFT JOIN text_chunks t ON d.id = t.doc_id
+                GROUP BY kb.id ORDER BY kb.create_time DESC;
+            """)
+            return self.cursor.fetchall()
+        except Exception as e:
+            st.error(f"💥 读取知识库失败：{str(e)[:80]}")
+            return []
+
+    def get_kb_chunks(self, kb_id, page=1, page_size=PAGE_SIZE):
+        try:
+            self.cursor.execute("""
+                SELECT COUNT(*) as total FROM text_chunks tc
+                JOIN documents d ON tc.doc_id = d.id WHERE d.kb_id = %s;
+            """, (kb_id,))
+            total = self.cursor.fetchone()['total']
+
+            total_pages = (total + page_size - 1) // page_size if total > 0 else 0
+            if page > total_pages and total_pages > 0:
+                page = total_pages
+            elif page < 1:
+                page = 1
+
+            offset = (page - 1) * page_size
+
+            self.cursor.execute("""
+                SELECT tc.id, tc.title, tc.content, tc.create_time, d.name as doc_name
+                FROM text_chunks tc
+                JOIN documents d ON tc.doc_id = d.id
+                WHERE d.kb_id = %s 
+                ORDER BY tc.create_time ASC, tc.id ASC
+                LIMIT %s OFFSET %s;
+            """, (kb_id, page_size, offset))
+            chunks = self.cursor.fetchall()
+
+            return chunks, total_pages, total
+        except Exception as e:
+            st.error(f"💥 读取分段失败：{str(e)[:80]}")
+            return [], 0, 0
+
+    def update_chunk(self, chunk_id, title, content, encoder):
+        if encoder is None or not isinstance(content, str):
+            st.error("💥 编码工具无效或分段内容异常，无法更新")
+            return False
+        try:
+            embedding = encoder.encode_text(content)
+            self.cursor.execute("""
+                UPDATE text_chunks SET title=%s, content=%s, embedding=%s
+                WHERE id=%s;
+            """, (title, content, embedding.tolist(), chunk_id))
+            self.conn.commit()
+            return True
+        except Exception as e:
+            self.conn.rollback()
+            st.error(f"💥 更新分段失败：{str(e)[:80]}")
+            return False
+
+    def delete_chunk(self, chunk_id):
+        try:
+            self.cursor.execute("DELETE FROM text_chunks WHERE id=%s;", (chunk_id,))
+            self.conn.commit()
+            return True
+        except Exception as e:
+            self.conn.rollback()
+            st.error(f"💥 删除分段失败：{str(e)[:80]}")
+            return False
+
+    def delete_kb(self, kb_id, kb_name):
+        try:
+            self.cursor.execute("DELETE FROM knowledge_base WHERE id=%s;", (kb_id,))
+            self.conn.commit()
+            st.success(f"✅ 知识库「{kb_name}」已删除")
+            return True
+        except Exception as e:
+            self.conn.rollback()
+            st.error(f"💥 删除知识库失败：{str(e)[:80]}")
+            return False
+
+    # 修复冗余代码bug，保留完整检索逻辑
+    def search_similar_chunks(self, query, encoder, top_k=5, kb_id=None):
+        try:
+            # 优化：简化向量编码校验，减少冗余逻辑
+            query_vector = encoder.encode_text(query)
+            # 直接判断向量是否有效，快速返回
+            if query_vector is None or len(query_vector) == 0 or np.all(query_vector == 0):
+                st.warning("⚠️ 问题编码失败，无法进行有效检索")
+                return []
+
+            if top_k is None:
+                top_k = 8  # 默认增加检索结果数量，提高信息覆盖率
+            # 新增：提前初始化results，避免变量未定义
+            results = []
+            params = []
+            # 修复：严格区分指定知识库和全局检索，无逻辑漏洞
+            if kb_id is None:
+                # 全局检索：遍历所有知识库，无kb_id过滤
+                base_sql = """
+                       SELECT tc.id, tc.title, tc.content, 
+                              tc.embedding <=> %s::vector(768) as cosine_distance,
+                              d.name as doc_name, kb.name as kb_name, tc.create_time
+                       FROM text_chunks tc
+                       JOIN documents d ON tc.doc_id = d.id
+                       JOIN knowledge_base kb ON d.kb_id = kb.id
+                       ORDER BY cosine_distance ASC, kb.id ASC 
+                       LIMIT %s;
+                   """
+                max_candidate = 50
+                candidate_num = min(top_k * 3, max_candidate)
+                params = [query_vector.tolist(), top_k * 10]  # 取更多候选结果，再筛选
+                self.cursor.execute(base_sql, params)
+                results = self.cursor.fetchall()
+            else:
+                # 步骤1：单独设置查询超时（无结果，无需fetchall）
+                set_timeout_sql = "SET statement_timeout = 5000;"
+                self.cursor.execute(set_timeout_sql)
+                # 指定知识库：严格过滤kb_id，确保范围可控
+                base_sql = """
+                       SELECT tc.id, tc.title, tc.content, 
+                              tc.embedding <=> %s::vector(768) as cosine_distance,
+                              d.name as doc_name, kb.name as kb_name, tc.create_time
+                       FROM text_chunks tc
+                       JOIN documents d ON tc.doc_id = d.id
+                       JOIN knowledge_base kb ON d.kb_id = kb.id
+                       WHERE d.kb_id = %s
+                       ORDER BY cosine_distance ASC
+                       LIMIT %s;
+                   """
+                max_candidate = 50
+                candidate_num = min(top_k * 3, max_candidate)
+                params = [query_vector.tolist(), kb_id, top_k * 3]
+                # 全局检索直接执行，无超时设置
+                self.cursor.execute(base_sql, params)
+                results = self.cursor.fetchall()
+
+                # 步骤3：执行SET重置（无结果），不调用fetchall()，无报错
+                reset_timeout_sql = "SET statement_timeout = 0;"
+                self.cursor.execute(reset_timeout_sql)  # 无结果，不调用fetchall()
+
+            # 新增：小知识库快速返回逻辑（结果少则直接处理，无需复杂流程）
+            if not results:
+                return []
+            # 若结果数量≤top_k，直接标记为有效结果，跳过后续冗余过滤
+            if len(results) <= top_k:
+                enhanced_results = []
+                for res in results:
+                    chunk_content = clean_text_local(res['content']).strip()
+                    if not chunk_content:
+                        continue
+                    cosine_sim = round(1 - res['cosine_distance'], 4)
+                    keyword_sim = calculate_keyword_match_score(query, chunk_content, top_k=5)
+                    total_sim = round((1 - KEYWORD_MATCH_WEIGHT) * cosine_sim + KEYWORD_MATCH_WEIGHT * keyword_sim, 4)
+                    res['cosine_similarity'] = cosine_sim
+                    res['keyword_similarity'] = keyword_sim
+                    res['total_similarity'] = total_sim
+                    del res['cosine_distance']
+                    enhanced_results.append(res)
+                # 直接排序返回，无需额外裁剪
+                enhanced_results.sort(key=lambda x: x['total_similarity'], reverse=True)
+                return enhanced_results[:top_k]
+
+            # 优化：放宽最小相似度阈值，从0.5降到0.4，避免有效结果被过滤
+            enhanced_results = []
+            for res in results:
+                # 新增：提前过滤无效分段，减少无效计算
+                chunk_content = clean_text_local(res['content']).strip()
+                if not chunk_content :  # 过滤空内容/超短内容
+                    continue
+                cosine_sim = round(1 - res['cosine_distance'], 4)
+                # 优化：提高关键词匹配的top_k，从3调到5，提取更多关键词，提高匹配准确性
+                keyword_sim = calculate_keyword_match_score(query, res['content'], top_k=5)
+                total_sim = round((1 - KEYWORD_MATCH_WEIGHT) * cosine_sim + KEYWORD_MATCH_WEIGHT * keyword_sim, 4)
+
+                res['cosine_similarity'] = cosine_sim
+                res['keyword_similarity'] = keyword_sim
+                res['total_similarity'] = total_sim
+                del res['cosine_distance']
+
+                # 全局检索时：先不提前筛选，保留所有候选集；指定知识库检索时，按0.4筛选
+                if kb_id is None:
+                    # 全局检索：延迟筛选，先保留所有候选结果
+                    enhanced_results.append(res)
+                else:
+                    # 指定知识库检索：保持原有筛选逻辑，不影响精准检索
+                    if total_sim >= 0.3:
+                        enhanced_results.append(res)
+
+            # 先裁剪综合相似度<0.2的低质量结果，减少排序数据量
+            enhanced_results = [item for item in enhanced_results if item['total_similarity'] >= 0.2]
+            # 按综合相似度排序，取top_k
+            enhanced_results.sort(key=lambda x: x['total_similarity'], reverse=True)
+            final_results = enhanced_results[:top_k]
+            return final_results
+        except Exception as e:
+            st.error(f"💥 向量检索失败：{str(e)[:80]}")
+            logging.error(f"向量检索失败详情：{traceback.format_exc()}")
+            return []
+
+# ====================== 2. 问答页签：严格复刻你的Country模型4步核心逻辑（解决空值问题） ==========
+def qa_tab():
+    st.subheader("🤖 知识库智能问答")
+    st.caption("4步核心：定义模型→创建Client→实例调chat→验证JSON→拆分显示")
+
+    if not st.session_state.init_ok:
+        st.warning("⚠️ 请先左侧初始化环境（数据库+模型）")
+        return
+
+    # 修复1：RealDictRow 键值访问
+    kbs = st.session_state.db_client.get_all_kbs()
+    kb_options = {"全局检索（所有知识库）": None}
+    if kbs:
+        for kb in kbs:
+            kb_options[kb['name']] = kb['id']
+
+    col1, col2 = st.columns([2, 1])
+    with col1:
+        selected_kb = st.selectbox("检索范围", options=list(kb_options.keys()), key="qa_kb")
+    with col2:
+        top_k = st.slider("返回上下文数量", 1, 15, 8, key="qa_top_k")  # 增加默认top_k，提高信息覆盖率
+
+    query = st.text_area(
+        "请输入你的问题",
+        placeholder="例如：韭菜常见病虫害有哪些？如何防治？",
+        height=120,
+        key="qa_query"
+    )
+    # 新增：是否显示思考过程复选框（默认勾选，取消后完全不渲染思考过程区域）
+    show_thinking = st.checkbox("显示思考过程", value=True, key="show_thinking")
+
+    if st.button("🔍 检索并生成智能回答", type="primary", key="qa_search_btn"):
+        if not query.strip():
+            st.error("❌ 问题不能为空，请输入有效问题！")
+            return
+
+        with st.spinner("正在检索知识库并按指定JSON格式生成回答..."):
+            db = st.session_state.db_client
+            encoder = st.session_state.encoder
+            kb_id = kb_options[selected_kb]
+
+            # 1. 检索知识库，构造查询结果文本（给Ollama的输入）
+            similar_chunks = db.search_similar_chunks(
+                query=query,
+                encoder=encoder,
+                top_k=top_k,
+                kb_id=kb_id
+            )
+
+            # 构造知识库查询结果文本（确保有内容，不返回空）
+            kb_search_text = ""
+            if similar_chunks:
+                kb_search_text = "\n\n".join([
+                    f"【第{idx+1}条 | 相似度{chunk['total_similarity']}】\n内容：{clean_text_local(chunk['content'])}"
+                    for idx, chunk in enumerate(similar_chunks)
+                ])
+            else:
+                kb_search_text = "未检索到任何与用户问题相关的知识库片段"
+
+            # ========== 关键：强制Prompt，要求Ollama仅返回标准JSON，无任何多余内容 ==========
+            # 比你的Country示例更明确，确保模型不返回空或非JSON
+            prompt_content = f"""
+你必须严格遵守以下指令，无任何例外：
+1.  输出格式：仅返回标准JSON字符串，不包含任何其他内容（无注释、无说明、无```json标记、无换行多余空格）。
+2.  JSON结构：必须严格匹配KnowledgeBaseAnswer模型，包含且仅包含3个字段：kb_search_results、thinking_process、final_conclusion，所有字段值均为非空字符串。
+3.  字段内容要求：
+   - kb_search_results：直接复制传入的「知识库查询结果」文本，不做任何修改。
+   - thinking_process：逐条分析知识库查询结果中的有效信息，说明每条信息与用户问题的相关性，非空。
+   - final_conclusion：基于知识库查询结果，给出明确、具体的回答，非空（即使无相关结果，也返回指定提示）。
+
+知识库查询结果：
+{kb_search_text}
+
+用户问题：{query}
+            """.strip()
+
+            # ========== 2. 严格按你的逻辑：显式创建Client实例，指定host（无冗余前缀） ==========
+            client = Client(host='http://127.0.0.1:11434')  # 完全对齐你的Country示例代码
+
+            # ========== 3. 严格按你的逻辑：通过Client实例调用chat方法，指定format为模型.schema ==========
+            try:
+                response = client.chat(
+                    messages=[
+                        {
+                            'role': 'user',
+                            'content': prompt_content,
+                        }
+                    ],
+                    model=OLLAMA_MODEL,
+                    format=KnowledgeBaseAnswer.model_json_schema(),  # 完全对齐你的Country示例
+                    stream=False,  # 关键：关闭流式返回，确保获取完整响应
+                    options={
+                        "temperature": 0.1,  # 降低温度，减少模型随机性，提高格式合规性
+                        "top_p": 0.9,
+                        "max_tokens": 2048  # 限制最大生成长度，避免超出上下文
+                    }
+                )
+            except Exception as e:
+                st.error(f"💥 Ollama调用失败：{str(e)[:100]}")
+                logging.error(f"调用失败详情：{traceback.format_exc()}")
+                return
+
+            # ========== 4. 严格按你的逻辑：验证JSON并解析（确保非空，清洗多余内容） ==========
+            try:
+                # 强力清洗：移除所有非JSON内容，确保解析成功
+                raw_json = response.message.content.strip()
+                raw_json = re.sub(r'^```json|```$', '', raw_json).strip()  # 移除代码块标记
+                raw_json = re.sub(r'^\s+|\s+$', '', raw_json)  # 移除首尾空格
+                if not raw_json:
+                    raise Exception("Ollama返回空JSON内容")
+
+                # 验证并解析JSON（完全对齐你的Country示例）
+                kb_answer = KnowledgeBaseAnswer.model_validate_json(raw_json)
+
+                # 最终兜底：确保每个字段非空（防止模型绕过指令）
+                if not kb_answer.kb_search_results.strip():
+                    kb_answer.kb_search_results = kb_search_text  # 直接赋值原始知识库内容
+                if not kb_answer.thinking_process.strip():
+                    kb_answer.thinking_process = "已检索知识库内容，未发现与用户问题相关的有效信息可供分析"
+                if not kb_answer.final_conclusion.strip():
+                    kb_answer.final_conclusion = "未从知识库中检索到与该问题直接相关的有效信息，无法给出针对性结论"
+
+            except Exception as e:
+                st.error(f"💥 JSON验证/解析失败：{str(e)[:100]}")
+                st.warning(f"原始响应内容：{getattr(response.message, 'content', '空响应')}")
+                # 解析失败时的兜底：手动构造非空JSON
+                kb_answer = KnowledgeBaseAnswer(
+                    kb_search_results=kb_search_text,
+                    thinking_process="JSON解析异常，无法正常分析知识库内容",
+                    final_conclusion="JSON解析异常，无法基于知识库生成有效回答"
+                )
+                logging.error(f"JSON解析失败详情：{traceback.format_exc()}")
+                return
+
+            # ========== 最终版：实事求是+精准显示+无冗余错乱 ==========
+            # 1. 提取并全局去重所有原文片段（从根源避免重复）
+            all_raw_fragments = set()
+            for idx, chunk in enumerate(similar_chunks):
+                content = clean_text_local(chunk['content']).strip()
+                if not content:
+                    continue
+                # 按|和换行拆分，存入集合自动去重
+                split_frags = content.replace("|", "\n").split("\n")
+                for frag in split_frags:
+                    frag = frag.strip()
+                    if frag:
+                        all_raw_fragments.add(frag)
+
+            # 2. 用疑问词（语法特征）精准拆分，分离有效内容和查询话术
+            question_words = ["有哪些", "如何", "是什么", "哪些", "怎样", "吗", "呢", "？"]
+            valid_content = set()  # 纯知识库有效内容
+            query_content = set()  # 纯查询话术（单独分离）
+
+            for frag in all_raw_fragments:
+                has_question = any(qw in frag for qw in question_words)
+                if not has_question:
+                    valid_content.add(frag)
+                    continue
+
+                # 精准拆分：按第一个疑问词切割，前面是有效内容，后面是话术
+                for qw in question_words:
+                    if qw in frag:
+                        stmt_part, qry_part = frag.split(qw, 1)
+                        stmt_part = stmt_part.strip()
+                        qry_part = (qw + qry_part).strip()
+                        if stmt_part:
+                            valid_content.add(stmt_part)
+                        if qry_part:
+                            query_content.add(qry_part)
+                        break
+
+            # 3. 生成最终结论（简洁清晰，只呈现有效信息）
+            conclusion_parts = [f"根据知识库检索到的有效信息，针对「{query}」的相关内容如下："]
+
+            # 显示知识库有效内容（核心结果）
+            if valid_content:
+                conclusion_parts.append("\n一、 知识库有效原文片段：")
+                for idx, content in enumerate(sorted(valid_content), 1):
+                    conclusion_parts.append(f"{idx}. {content}")
+
+            # 可选：隐藏查询话术（若不需要显示，直接删除该部分）
+            if query_content and False:  # 改为True则显示，False则隐藏
+                conclusion_parts.append("\n二、 关联查询话术：")
+                for idx, qry in enumerate(sorted(query_content), 1):
+                    conclusion_parts.append(f"{idx}. {qry}")
+
+            # 兜底逻辑
+            if not valid_content and not query_content:
+                conclusion_parts.append("- 未检索到相关有效信息。")
+
+            # 拼接最终结果
+            optimized_final_conclusion = "\n".join(conclusion_parts).strip()
+
+            # 仅替换模型兜底的无效结论
+            default_conclusions = [
+                "未从知识库中检索到与该问题直接相关的有效信息，无法给出针对性结论",
+                "JSON解析异常，无法基于知识库生成有效回答"
+            ]
+            if kb_answer.final_conclusion in default_conclusions:
+                kb_answer.final_conclusion = optimized_final_conclusion
+            # ========== 最终版结束 ==========
+
+            # ========== 5. 按JSON字段拆分显示（完全满足你的要求，非空） ==========
+            # 第一步：显示知识库查询结果（JSON的kb_search_results字段）
+            st.markdown("### 📋 第一部分：知识库查询结果（JSON字段：kb_search_results）")
+            if similar_chunks:
+                with st.expander(f"点击展开/收起（共{len(similar_chunks)}条结果）", expanded=True):
+                    for idx, chunk in enumerate(similar_chunks, 1):
+                        st.markdown(f"""
+<div style="background:#f5f7fa;padding:10px;border-radius:6px;margin-bottom:8px;">
+    <strong>第{idx}条 | 知识库：{chunk['kb_name']} | 文档：{chunk['doc_name']}</strong>
+    <br>
+    <strong>综合相似度：{chunk['total_similarity']} | 余弦相似度：{chunk['cosine_similarity']}</strong>
+    <br>
+    <strong>标题：</strong>{chunk['title']}
+    <br>
+    <strong>内容：</strong>{clean_text_local(chunk['content'])}
+</div>
+                        """, unsafe_allow_html=True)
+            else:
+                st.markdown(f"""
+<div style="background:#fef7f7;padding:10px;border-radius:6px;color:#dc2626;">
+    {kb_answer.kb_search_results}  <!-- 显示JSON字段内容 -->
+</div>
+                """, unsafe_allow_html=True)
+
+            # 第二步：显示思考过程（仅当show_thinking为True时，才渲染整个思考过程区域）
+            if show_thinking:  # 新增条件判断：不满足则完全不执行以下渲染代码
+                st.markdown("### 🧠 第二部分：思考过程（JSON字段：thinking_process）")
+                st.markdown(f"""
+            <div style="background:#eef2ff;padding:12px;border-radius:8px;border:1px solid #c7d2fe;">
+                {kb_answer.thinking_process}  <!-- 显示JSON字段内容 -->
+            </div>
+                """, unsafe_allow_html=True)
+
+            # 第三步：动态调整知识库结论的标题序号（核心修改点）
+            if show_thinking:
+                # 开启思考过程：显示为第三部分
+                st.markdown("### 💡 第三部分：知识库结论（JSON字段：final_conclusion）")
+            else:
+                # 关闭思考过程：自动切换为第二部分
+                st.markdown("### 💡 第二部分：知识库结论（JSON字段：final_conclusion）")
+            st.markdown(f"""
+<div style="background:#ecfdf5;padding:12px;border-radius:8px;border:1px solid #a7f3d0;font-size:16px;">
+    {kb_answer.final_conclusion}  <!-- 显示JSON字段内容 -->
+</div>
+            """, unsafe_allow_html=True)
+
+            # 可选：打印完整JSON（验证格式正确）
+            with st.expander("📄 查看完整JSON响应"):
+                st.json(kb_answer.model_dump())  # 显示标准JSON
+
+# ====================== 知识库管理页签（完全保留） ======================
+def kb_manage_tab():
+    col1, col2 = st.columns([1, 2])
+
+    with col1:
+        if st.session_state.init_ok:
+            st.subheader("📝 知识库管理")
+            st.caption("✅ 批量上传+自动重试超时文件（PDF专项优化）")
+
+            with st.form("upload_form", clear_on_submit=True):
+                kb_name = st.text_input("知识库名称", placeholder="输入名称（新增/追加）", key="kb_name")
+                files = st.file_uploader(
+                    "上传文件（优先支持PDF/TXT/DOCX/Excel）",
+                    type=['pdf', 'txt', 'docx', 'xlsx', 'xls'],
+                    accept_multiple_files=True,
+                    key="file_uploader"
+                )
+                submit_btn = st.form_submit_button("🚀 上传+自动重试超时文件", type="primary")
+
+                if submit_btn and kb_name and files:
+                    if len(files) > MAX_FILES_PER_UPLOAD:
+                        st.error(f"❌ 单次最多上传{MAX_FILES_PER_UPLOAD}个文件")
+                    else:
+                        with st.spinner("处理中..."):
+                            db = st.session_state.db_client
+                            encoder = st.session_state.encoder
+                            chunk_size = st.session_state.chunk_size
+                            sim_threshold = st.session_state.sim_threshold
+                            kb_id = db.get_kb_id(kb_name)
+                            if kb_id:
+                                success_files, total_chunks, file_status = db.batch_upload_auto_retry(
+                                    kb_id, files, encoder,
+                                    chunk_size=chunk_size,
+                                    sim_threshold=sim_threshold
+                                )
+                                st.session_state.file_status = file_status
+                                st.success(f"🎉 完成！成功{success_files}文件，新增{total_chunks}分段")
+
+            st.divider()
+            st.subheader("🗑️ 删除知识库")
+            st.warning("⚠️ 数据永久丢失！")
+
+            kbs = st.session_state.db_client.get_all_kbs()
+            if kbs:
+                kb_options = {kb['name']: kb['id'] for kb in kbs}
+                del_kb_name = st.selectbox("选择知识库", options=list(kb_options.keys()), key="del_kb")
+
+                if st.button("⚠️ 确认删除", type="secondary", key="del_kb_btn"):
+                    st.session_state.kb_to_del = (kb_options[del_kb_name], del_kb_name)
+                    st.session_state.del_kb_confirm = True
+
+                if st.session_state.del_kb_confirm and st.session_state.kb_to_del:
+                    kb_id, kb_name = st.session_state.kb_to_del
+                    st.error(f"🚨 最终确认：删除「{kb_name}」？")
+                    col_final1, col_final2 = st.columns(2)
+                    with col_final1:
+                        if st.button("✅ 永久删除", key="final_del"):
+                            st.session_state.db_client.delete_kb(kb_id, kb_name)
+                            st.session_state.del_kb_confirm = False
+                            st.session_state.kb_to_del = None
+                            st.session_state.current_kb_id = None
+                            st.rerun()
+                    with col_final2:
+                        if st.button("❌ 取消", key="cancel_del"):
+                            st.session_state.del_kb_confirm = False
+                            st.session_state.kb_to_del = None
+        else:
+            st.info("请先初始化环境")
+
+    with col2:
+        if st.session_state.init_ok:
+            st.subheader("📋 知识库内容")
+
+            kbs = st.session_state.db_client.get_all_kbs()
+            if kbs:
+                kb_display_options = {
+                    f"{kb['name']} | 文档{kb['doc_count']} | 分段{kb['chunk_count']}": kb['id']
+                    for kb in kbs
+                }
+                selected_kb_str = st.selectbox(
+                    "选择知识库",
+                    options=list(kb_display_options.keys()),
+                    key="selected_kb"
+                )
+                current_kb_id = kb_display_options[selected_kb_str]
+
+                if st.session_state.current_kb_id != current_kb_id:
+                    st.session_state.current_kb_id = current_kb_id
+                    st.session_state.current_page = 1
+
+                chunks, total_pages, total = st.session_state.db_client.get_kb_chunks(
+                    current_kb_id,
+                    page=st.session_state.current_page,
+                    page_size=PAGE_SIZE
+                )
+
+                col_p1, col_p2, col_p3 = st.columns([1, 2, 1])
+                with col_p1:
+                    if st.button("⬅️ 上一页", disabled=st.session_state.current_page <= 1, key="prev_page"):
+                        st.session_state.current_page -= 1
+                with col_p2:
+                    st.write(f"第{st.session_state.current_page}/{total_pages}页 | 共{total}分段")
+                with col_p3:
+                    if st.button("下一页 ➡️", disabled=st.session_state.current_page >= total_pages, key="next_page"):
+                        st.session_state.current_page += 1
+
+                st.divider()
+                if chunks:
+                    encoder = st.session_state.encoder
+                    for chunk in chunks:
+                        chunk_id = chunk['id']
+                        is_editing = st.session_state.edit_chunk_id == chunk_id
+
+                        with st.expander(f"📑 {chunk['title']} | {chunk['doc_name']}", expanded=is_editing):
+                            if not is_editing and not st.session_state.del_confirm:
+                                st.text_area("内容", value=chunk['content'], height=150, disabled=True,
+                                             key=f"content_view_{chunk_id}")
+                                col_btn1, col_btn2 = st.columns(2)
+                                with col_btn1:
+                                    if st.button(f"✏️ 编辑", key=f"edit_{chunk_id}"):
+                                        st.session_state.edit_chunk_id = chunk_id
+                                with col_btn2:
+                                    if st.button(f"🗑️ 删除", key=f"del_{chunk_id}"):
+                                        st.session_state.edit_chunk_id = chunk_id
+                                        st.session_state.del_confirm = True
+
+                            elif st.session_state.del_confirm and st.session_state.edit_chunk_id == chunk_id:
+                                st.warning("⚠️ 确认删除该分段？")
+                                col_c1, col_c2 = st.columns(2)
+                                with col_c1:
+                                    if st.button(f"✅ 确认", key=f"conf_del_{chunk_id}"):
+                                        st.session_state.db_client.delete_chunk(chunk_id)
+                                        st.session_state.edit_chunk_id = None
+                                        st.session_state.del_confirm = False
+                                        st.rerun()
+                                with col_c2:
+                                    if st.button(f"❌ 取消", key=f"cancel_del_{chunk_id}"):
+                                        st.session_state.edit_chunk_id = None
+                                        st.session_state.del_confirm = False
+
+                            else:
+                                new_title = st.text_input("标题", value=chunk['title'], key=f"title_{chunk_id}")
+                                new_content = st.text_area("内容", value=chunk['content'], height=150,
+                                                           key=f"content_{chunk_id}")
+                                col_s1, col_s2 = st.columns(2)
+                                with col_s1:
+                                    if st.button(f"💾 保存", key=f"save_{chunk_id}"):
+                                        st.session_state.db_client.update_chunk(chunk_id, new_title, new_content,
+                                                                                encoder)
+                                        st.session_state.edit_chunk_id = None
+                                        st.success("✅ 保存成功")
+                                with col_s2:
+                                    if st.button(f"❌ 取消", key=f"cancel_edit_{chunk_id}"):
+                                        st.session_state.edit_chunk_id = None
+                else:
+                    if total == 0:
+                        st.info("该知识库暂无内容")
+                    else:
+                        st.warning(f"⚠️ 当前页码{st.session_state.current_page}无数据，已自动调整到最后一页")
+                        st.session_state.current_page = total_pages
+                        st.rerun()
+            else:
+                st.info("暂无知识库，请先创建上传")
+        else:
+            st.info("请先初始化环境")
+
+
+# ====================== 主函数（完全保留） ======================
+def main():
+    st.set_page_config(
+        page_title="知识库问答系统",
+        page_icon="📚",
+        layout="wide"
+    )
+
+    #st.title("📚 向量数据库知识库问答系统（PGVector+deepseek）")
+    #st.divider()
+
+    st.markdown(HIDE_ST_STYLE, unsafe_allow_html=True)
+
+    # 初始化session_state
+    init_vars = {
+        "db_client": None,
+        "init_ok": False,
+        "current_kb_id": None,
+        "current_page": 1,
+        "edit_chunk_id": None,
+        "del_confirm": False,
+        "del_kb_confirm": False,
+        "kb_to_del": None,
+        "file_status": {},
+        "encoder": None
+    }
+    for key, val in init_vars.items():
+        if key not in st.session_state:
+            st.session_state[key] = val
+
+    # 侧边栏配置（完全保留）
+    with st.sidebar:
+        st.subheader("⚙️ 核心配置")
+
+        st.caption("📦 数据库配置")
+        db_host = st.text_input("主机", value=DEFAULT_DB_CONFIG['host'], key="db_host")
+        db_port = st.number_input("端口", value=DEFAULT_DB_CONFIG['port'], key="db_port", step=1)
+        db_user = st.text_input("用户名", value=DEFAULT_DB_CONFIG['user'], key="db_user")
+        db_pwd = st.text_input("密码", value="", type="password", key="db_pwd")
+        db_name = st.text_input("数据库名", value=DEFAULT_DB_CONFIG['dbname'], key="db_name")
+
+        st.caption("🧠 模型&分段配置")
+        model_type = st.selectbox(
+            "模型类型",
+            options=["双模型融合", "text2vec-base-chinese", "bert-base-chinese"],
+            key="model_type",
+            index=0
+        )
+        use_cuda = st.checkbox("启用CUDA", value=USE_CUDA_DEFAULT, key="use_cuda")
+        st.slider("分段字符数", 100, 300, CHUNK_SIZE_DEFAULT, key="chunk_size")
+        st.slider("最小分段长度", 10, 100, MIN_LENGTH_DEFAULT, key="min_length")
+        st.slider("相似度阈值", 0.7, 0.9, 0.8, 0.01, key="sim_threshold")
+
+        if st.button("🔌 初始化环境", type="primary", disabled=st.session_state.init_ok, key="init_btn"):
+            with st.spinner("初始化中..."):
+                try:
+                    encoder = get_local_encoder(st.session_state.use_cuda, st.session_state.model_type)
+                    db_config = {
+                        "host": st.session_state.db_host,
+                        "port": st.session_state.db_port,
+                        "user": st.session_state.db_user,
+                        "password": st.session_state.db_pwd,
+                        "dbname": st.session_state.db_name
+                    }
+                    st.session_state.db_client = LocalPGVectorDB(db_config)
+                    st.session_state.encoder = encoder
+                    st.session_state.init_ok = True
+                    st.success("✅ 环境初始化完成")
+                    st.rerun()
+                except Exception as e:
+                    st.error(f"💥 初始化失败：{str(e)[:100]}")
+                    logging.error(f"初始化失败详情：{traceback.format_exc()}")
+
+        stop_word_config_panel()
+
+    # 双页签
+    tab1, tab2 = st.tabs(["🤖 智能问答", "📚 知识库管理"])
+    with tab1:
+        qa_tab()
+    with tab2:
+        kb_manage_tab()
+
+
+if __name__ == "__main__":
+    main()

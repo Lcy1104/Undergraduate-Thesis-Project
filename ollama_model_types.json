@@ -1,0 +1,6 @@
+{
+  "deepseek-r1:7b": "LLM",
+  "gpt-oss:120b-cloud": "LLM",
+  "minicpm-v:8b": "Vision",
+  "deepseek-r1:latest": "LLM"
+}
