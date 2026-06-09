@@ -1,1 +1,0 @@
-yolo export model=best.pt format=openvino imgsz=640 half=True
